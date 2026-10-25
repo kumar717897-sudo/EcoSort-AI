@@ -1,0 +1,6 @@
+{
+  "name": "EcoSort AI",
+  "description": "Mobile-first waste classification app for sustainability hackathons. Classifies paper/cardboard, plastic, and organic fruit/vegetable scraps using real inference with English/Hindi disposal guidance.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
