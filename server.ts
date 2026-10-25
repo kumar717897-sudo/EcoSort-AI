@@ -210,10 +210,174 @@ app.get('/api/samples', (req, res) => {
   res.json({ samples });
 });
 
+// Local WasteWise ONNX inference runner
+async function runOnnxClassification(imgBuffer: Buffer, cleanBase64: string) {
+  const session = await getOnnxSession();
+
+  // Preprocess image to 224x224 RGB Float32Array
+  const { data } = await sharp(imgBuffer)
+    .resize(224, 224, { fit: 'fill' })
+    .removeAlpha()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+
+  const pixelCount = 224 * 224;
+  const float32Data = new Float32Array(1 * 3 * 224 * 224);
+  for (let i = 0; i < pixelCount; i++) {
+    float32Data[i] = data[i * 3 + 0] / 255.0; // R
+    float32Data[pixelCount + i] = data[i * 3 + 1] / 255.0; // G
+    float32Data[pixelCount * 2 + i] = data[i * 3 + 2] / 255.0; // B
+  }
+
+  const inputName = session.inputNames[0];
+  const tensor = new ort.Tensor('float32', float32Data, [1, 3, 224, 224]);
+  const results = await session.run({ [inputName]: tensor });
+  const outputTensor = results[session.outputNames[0]];
+  const rawScores = Array.from(outputTensor.data as Float32Array);
+
+  // Model output is softmax probabilities summing to ~1.0
+  const predictions = ONNX_CLASSES.map((className, idx) => ({
+    className,
+    score: Math.max(0, Math.min(1, rawScores[idx])),
+  })).sort((a, b) => b.score - a.score);
+
+  const top1 = predictions[0];
+  let mappedCategory: 'paper_cardboard' | 'plastic' | 'organic' | 'uncertain_unsupported' = 'uncertain_unsupported';
+  let confidence = top1.score;
+  let detectedName = top1.className;
+  let reasonEn = '';
+  let reasonHi = '';
+
+  const isTopClassUnsupported = ['battery', 'glass', 'metal', 'trash'].includes(top1.className);
+
+  // Check for known limitation: WasteWise YOLOv8 was trained on office trash and
+  // frequently misclassifies organic peels (like banana peels) as cardboard/paper.
+  // If cardboard or paper is predicted, cross-validate with Gemini vision if available.
+  if (top1.className === 'cardboard' || top1.className === 'paper') {
+    let validated = false;
+    try {
+      const valPrompt = {
+        parts: [
+          { inlineData: { mimeType: 'image/jpeg', data: cleanBase64 } },
+          {
+            text: `Analyze this image strictly for waste segregation.
+We only support 3 categories: "paper_cardboard", "plastic", "organic", or "uncertain_unsupported".
+Is this actually paper/cardboard, or is it an organic fruit/veg peel (e.g. banana peel, fruit scrap) or non-waste?
+Respond in JSON: { "category": string, "confidence": number, "detectedItem": string, "reasonEn": string, "reasonHi": string }`,
+          },
+        ],
+      };
+      const valConfig = {
+        responseMimeType: 'application/json',
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            category: { type: Type.STRING },
+            confidence: { type: Type.NUMBER },
+            detectedItem: { type: Type.STRING },
+            reasonEn: { type: Type.STRING },
+            reasonHi: { type: Type.STRING },
+          },
+          required: ['category', 'confidence', 'detectedItem', 'reasonEn', 'reasonHi'],
+        },
+      };
+
+      let valResp;
+      try {
+        valResp = await ai.models.generateContent({
+          model: 'gemini-3.1-flash-lite',
+          contents: valPrompt,
+          config: valConfig,
+        });
+      } catch {
+        valResp = await ai.models.generateContent({
+          model: 'gemini-flash-latest',
+          contents: valPrompt,
+          config: valConfig,
+        });
+      }
+
+      const valData = JSON.parse(valResp.text || '{}');
+      if (valData.category === 'organic') {
+        mappedCategory = 'organic';
+        confidence = valData.confidence || 0.95;
+        detectedName = valData.detectedItem || 'Organic fruit/vegetable scraps';
+        reasonEn = `${detectedName} verified as compostable organic food scraps (corrected from model texture confusion).`;
+        reasonHi = `${detectedName} को खाद बनाने योग्य जैविक कचरे के रूप में सत्यापित किया गया।`;
+        validated = true;
+      } else if (valData.category === 'paper_cardboard') {
+        mappedCategory = 'paper_cardboard';
+        confidence = top1.score;
+        detectedName = top1.className === 'cardboard' ? 'Cardboard packaging' : 'Paper material';
+        reasonEn = `Classified as ${detectedName} with ${(confidence * 100).toFixed(1)}% model confidence.`;
+        reasonHi = `मॉडल द्वारा ${(confidence * 100).toFixed(1)}% विश्वास के साथ ${detectedName} पहचाना गया।`;
+        validated = true;
+      } else {
+        mappedCategory = 'uncertain_unsupported';
+        confidence = valData.confidence || top1.score;
+        detectedName = valData.detectedItem || 'Uncertain / Unsupported';
+        reasonEn = valData.reasonEn || 'Ambiguous item; not clearly recyclable paper, plastic, or organic scraps.';
+        reasonHi = valData.reasonHi || 'अस्पष्ट वस्तु; रीसायकल योग्य कागज, प्लास्टिक या जैविक कचरा नहीं है।';
+        validated = true;
+      }
+    } catch {
+      // Validator unreachable or rate-limited
+    }
+
+    if (!validated) {
+      mappedCategory = 'uncertain_unsupported';
+      confidence = top1.score;
+      detectedName = 'Ambiguous Fiber / Potential Organic';
+      reasonEn = `Visual features are ambiguous between paper/cardboard and organic peel. Marked uncertain to prevent bin contamination.`;
+      reasonHi = `कागज और जैविक छिलके के बीच अस्पष्टता। कचरा मिश्रण रोकने हेतु अनिश्चित रखा गया।`;
+    }
+  } else if (top1.className === 'plastic' && top1.score >= 0.60) {
+    mappedCategory = 'plastic';
+    confidence = top1.score;
+    detectedName = 'Plastic material';
+    reasonEn = `Classified as Plastic packaging/bottle with ${(confidence * 100).toFixed(1)}% model confidence.`;
+    reasonHi = `मॉडल द्वारा ${(confidence * 100).toFixed(1)}% विश्वास के साथ प्लास्टिक सामग्री के रूप में पहचाना गया।`;
+  } else if (top1.className === 'biological' && top1.score >= 0.50) {
+    mappedCategory = 'organic';
+    confidence = top1.score;
+    detectedName = 'Organic / Food scraps';
+    reasonEn = `Classified as Organic biological fruit/vegetable scraps with ${(confidence * 100).toFixed(1)}% model confidence.`;
+    reasonHi = `मॉडल द्वारा ${(confidence * 100).toFixed(1)}% विश्वास के साथ जैविक फल/सब्जी के छिलके पहचाने गए।`;
+  } else {
+    mappedCategory = 'uncertain_unsupported';
+    confidence = top1.score;
+    detectedName = isTopClassUnsupported ? `${top1.className} (Unsupported class)` : 'Ambiguous / Low Confidence';
+    reasonEn = isTopClassUnsupported
+      ? `Identified as ${top1.className}, which is not one of our 3 supported recycling categories (Paper, Plastic, Organic).`
+      : `Insufficient visual evidence (${(top1.score * 100).toFixed(1)}% top score). Not forced into a category to prevent contamination.`;
+    reasonHi = isTopClassUnsupported
+      ? `पहचाना गया: ${top1.className}, जो हमारे 3 समर्थित श्रेणियों (कागज, प्लास्टिक, जैविक) में नहीं आता।`
+      : `स्पष्ट पहचान नहीं हो सकी (केवल ${(top1.score * 100).toFixed(1)}% विश्वसनीयता)। कचरा मिश्रण रोकने हेतु अनिश्चित रखा गया।`;
+  }
+
+  const guidance = DISPOSAL_GUIDELINES[mappedCategory];
+
+  return {
+    category: mappedCategory,
+    confidence: Number(confidence.toFixed(4)),
+    detectedItem: detectedName,
+    reasonEn,
+    reasonHi,
+    modelName: 'WasteWise YOLOv8n-cls (Dedicated Waste Model)',
+    modelSource: 'Hugging Face: Arihant0902/wastewise-garbage-cls',
+    license: 'Apache-2.0',
+    allPredictions: predictions.map(p => ({
+      label: p.className,
+      percentage: Number((p.score * 100).toFixed(2)),
+    })),
+    guidance,
+  };
+}
+
 // Classification Endpoint
 app.post('/api/classify', async (req, res) => {
   try {
-    const { imageBase64, modelChoice = 'wastewise' } = req.body;
+    const { imageBase64, modelChoice = 'gemini' } = req.body;
 
     if (!imageBase64) {
       return res.status(400).json({ error: 'No image provided. Please upload an image.' });
@@ -228,185 +392,10 @@ app.post('/api/classify', async (req, res) => {
     }
 
     if (modelChoice === 'wastewise') {
-      // 1. WasteWise ONNX inference
-      const session = await getOnnxSession();
-
-      // Preprocess image to 224x224 RGB Float32Array
-      const { data } = await sharp(imgBuffer)
-        .resize(224, 224, { fit: 'fill' })
-        .removeAlpha()
-        .raw()
-        .toBuffer({ resolveWithObject: true });
-
-      const pixelCount = 224 * 224;
-      const float32Data = new Float32Array(1 * 3 * 224 * 224);
-      for (let i = 0; i < pixelCount; i++) {
-        float32Data[i] = data[i * 3 + 0] / 255.0; // R
-        float32Data[pixelCount + i] = data[i * 3 + 1] / 255.0; // G
-        float32Data[pixelCount * 2 + i] = data[i * 3 + 2] / 255.0; // B
-      }
-
-      const inputName = session.inputNames[0];
-      const tensor = new ort.Tensor('float32', float32Data, [1, 3, 224, 224]);
-      const results = await session.run({ [inputName]: tensor });
-      const outputTensor = results[session.outputNames[0]];
-      const rawScores = Array.from(outputTensor.data as Float32Array);
-
-      // Model output is already softmax probabilities summing to ~1.0
-      const predictions = ONNX_CLASSES.map((className, idx) => ({
-        className,
-        score: Math.max(0, Math.min(1, rawScores[idx])),
-      })).sort((a, b) => b.score - a.score);
-
-      const top1 = predictions[0];
-      const top2 = predictions[1];
-
-      // Mapping rules:
-      // Paper/Cardboard: cardboard, paper
-      // Plastic: plastic
-      // Organic: biological
-      // Non-supported classes: battery, glass, metal, trash
-      let mappedCategory: 'paper_cardboard' | 'plastic' | 'organic' | 'uncertain_unsupported' = 'uncertain_unsupported';
-      let confidence = top1.score;
-      let detectedName = top1.className;
-      let reasonEn = '';
-      let reasonHi = '';
-
-      const isTopClassUnsupported = ['battery', 'glass', 'metal', 'trash'].includes(top1.className);
-
-      // Check for known limitation: WasteWise YOLOv8 was trained on office trash and
-      // frequently misclassifies organic peels (like banana peels) as cardboard/paper.
-      // If cardboard or paper is predicted, cross-validate with Gemini vision if available.
-      if (top1.className === 'cardboard' || top1.className === 'paper') {
-        let validated = false;
-        try {
-          const valPrompt = {
-            parts: [
-              { inlineData: { mimeType: 'image/jpeg', data: cleanBase64 } },
-              {
-                text: `Analyze this image strictly for waste segregation.
-We only support 3 categories: "paper_cardboard", "plastic", "organic", or "uncertain_unsupported".
-Is this actually paper/cardboard, or is it an organic fruit/veg peel (e.g. banana peel, fruit scrap) or non-waste?
-Respond in JSON: { "category": string, "confidence": number, "detectedItem": string, "reasonEn": string, "reasonHi": string }`
-              }
-            ]
-          };
-          const valConfig = {
-            responseMimeType: 'application/json',
-            responseSchema: {
-              type: Type.OBJECT,
-              properties: {
-                category: { type: Type.STRING },
-                confidence: { type: Type.NUMBER },
-                detectedItem: { type: Type.STRING },
-                reasonEn: { type: Type.STRING },
-                reasonHi: { type: Type.STRING },
-              },
-              required: ['category', 'confidence', 'detectedItem', 'reasonEn', 'reasonHi'],
-            }
-          };
-
-          let valResp;
-          try {
-            valResp = await ai.models.generateContent({
-              model: 'gemini-flash-latest',
-              contents: valPrompt,
-              config: valConfig,
-            });
-          } catch {
-            try {
-              valResp = await ai.models.generateContent({
-                model: 'gemini-3.1-flash-lite',
-                contents: valPrompt,
-                config: valConfig,
-              });
-            } catch {
-              valResp = await ai.models.generateContent({
-                model: 'gemini-3.8-flash',
-                contents: valPrompt,
-                config: valConfig,
-              });
-            }
-          }
-
-          const valData = JSON.parse(valResp.text || '{}');
-          if (valData.category === 'organic') {
-            mappedCategory = 'organic';
-            confidence = valData.confidence || 0.95;
-            detectedName = valData.detectedItem || 'Organic fruit/vegetable scraps';
-            reasonEn = `${detectedName} verified as compostable organic food scraps (corrected from model texture confusion).`;
-            reasonHi = `${detectedName} को खाद बनाने योग्य जैविक कचरे के रूप में सत्यापित किया गया।`;
-            validated = true;
-          } else if (valData.category === 'paper_cardboard') {
-            mappedCategory = 'paper_cardboard';
-            confidence = top1.score;
-            detectedName = top1.className === 'cardboard' ? 'Cardboard packaging' : 'Paper material';
-            reasonEn = `Classified as ${detectedName} with ${(confidence * 100).toFixed(1)}% model confidence.`;
-            reasonHi = `मॉडल द्वारा ${(confidence * 100).toFixed(1)}% विश्वास के साथ ${detectedName} पहचाना गया।`;
-            validated = true;
-          } else {
-            mappedCategory = 'uncertain_unsupported';
-            confidence = valData.confidence || top1.score;
-            detectedName = valData.detectedItem || 'Uncertain / Unsupported';
-            reasonEn = valData.reasonEn || 'Ambiguous item; not clearly recyclable paper, plastic, or organic scraps.';
-            reasonHi = valData.reasonHi || 'अस्पष्ट वस्तु; रीसायकल योग्य कागज, प्लास्टिक या जैविक कचरा नहीं है।';
-            validated = true;
-          }
-        } catch {
-          // If validator is unreachable
-        }
-
-        if (!validated) {
-          mappedCategory = 'uncertain_unsupported';
-          confidence = top1.score;
-          detectedName = 'Ambiguous Fiber / Potential Organic';
-          reasonEn = `Visual features are ambiguous between paper/cardboard and organic peel. Marked uncertain to prevent bin contamination.`;
-          reasonHi = `कागज और जैविक छिलके के बीच अस्पष्टता। कचरा मिश्रण रोकने हेतु अनिश्चित रखा गया।`;
-        }
-      } else if (top1.className === 'plastic' && top1.score >= 0.60) {
-        mappedCategory = 'plastic';
-        confidence = top1.score;
-        detectedName = 'Plastic material';
-        reasonEn = `Classified as Plastic packaging/bottle with ${(confidence * 100).toFixed(1)}% model confidence.`;
-        reasonHi = `मॉडल द्वारा ${(confidence * 100).toFixed(1)}% विश्वास के साथ प्लास्टिक सामग्री के रूप में पहचाना गया।`;
-      } else if (top1.className === 'biological' && top1.score >= 0.50) {
-        mappedCategory = 'organic';
-        confidence = top1.score;
-        detectedName = 'Organic / Food scraps';
-        reasonEn = `Classified as Organic biological fruit/vegetable scraps with ${(confidence * 100).toFixed(1)}% model confidence.`;
-        reasonHi = `मॉडल द्वारा ${(confidence * 100).toFixed(1)}% विश्वास के साथ जैविक फल/सब्जी के छिलके पहचाने गए।`;
-      } else {
-        mappedCategory = 'uncertain_unsupported';
-        confidence = top1.score;
-        detectedName = isTopClassUnsupported ? `${top1.className} (Unsupported class)` : 'Ambiguous / Low Confidence';
-        reasonEn = isTopClassUnsupported
-          ? `Identified as ${top1.className}, which is not one of our 3 supported recycling categories (Paper, Plastic, Organic).`
-          : `Insufficient visual evidence (${(top1.score * 100).toFixed(1)}% top score). Not forced into a category to prevent contamination.`;
-        reasonHi = isTopClassUnsupported
-          ? `पहचाना गया: ${top1.className}, जो हमारे 3 समर्थित श्रेणियों (कागज, प्लास्टिक, जैविक) में नहीं आता।`
-          : `स्पष्ट पहचान नहीं हो सकी (केवल ${(top1.score * 100).toFixed(1)}% विश्वसनीयता)। कचरा मिश्रण रोकने हेतु अनिश्चित रखा गया।`;
-      }
-
-      const guidance = DISPOSAL_GUIDELINES[mappedCategory];
-
-      return res.json({
-        category: mappedCategory,
-        confidence: Number(confidence.toFixed(4)),
-        detectedItem: detectedName,
-        reasonEn,
-        reasonHi,
-        modelName: 'WasteWise YOLOv8n-cls (Dedicated Waste Model)',
-        modelSource: 'Hugging Face: Arihant0902/wastewise-garbage-cls',
-        license: 'Apache-2.0',
-        allPredictions: predictions.map(p => ({
-          label: p.className,
-          percentage: Number((p.score * 100).toFixed(2)),
-        })),
-        guidance,
-      });
-
+      const onnxResult = await runOnnxClassification(imgBuffer, cleanBase64);
+      return res.json(onnxResult);
     } else {
-      // 2. Gemini Vision inference (with 503 retry resilience)
+      // 2. Gemini Vision inference (with resilient multi-tier fallback and quota protection)
       const promptParts = [
         {
           inlineData: {
@@ -467,23 +456,23 @@ Provide bilingual English and Hindi disposal guidance and reason.`,
       let response;
       try {
         response = await ai.models.generateContent({
-          model: 'gemini-flash-latest',
+          model: 'gemini-3.1-flash-lite',
           contents: { parts: promptParts },
           config: genConfig,
         });
       } catch (err: any) {
         try {
           response = await ai.models.generateContent({
-            model: 'gemini-3.1-flash-lite',
+            model: 'gemini-flash-latest',
             contents: { parts: promptParts },
             config: genConfig,
           });
-        } catch {
-          response = await ai.models.generateContent({
-            model: 'gemini-3.8-flash',
-            contents: { parts: promptParts },
-            config: genConfig,
-          });
+        } catch (fallbackErr: any) {
+          // If cloud models hit rate limit or quota exhaustion (e.g. 429 RESOURCE_EXHAUSTED),
+          // gracefully fallback to local WasteWise ONNX inference so the request NEVER fails!
+          console.warn('Cloud API quota exhausted or unavailable. Falling back to local WasteWise model:', fallbackErr?.message);
+          const localResult = await runOnnxClassification(imgBuffer, cleanBase64);
+          return res.json(localResult);
         }
       }
 
@@ -500,14 +489,24 @@ Provide bilingual English and Hindi disposal guidance and reason.`,
         detectedItem: parsed.detectedItem || 'Detected Item',
         reasonEn: parsed.reasonEn || '',
         reasonHi: parsed.reasonHi || '',
-        modelName: 'Gemini 3.8 Flash Vision (Cloud Multimodal)',
+        modelName: 'Gemini Vision (Cloud Multimodal)',
         modelSource: 'Google AI Studio (@google/genai SDK)',
         license: 'Google AI Studio Terms of Service',
         guidance,
       });
     }
   } catch (error: any) {
-    console.error('Classification error:', error);
+    console.warn('Handling classification error with local fallback:', error?.message);
+    try {
+      const cleanBase64 = (req.body?.imageBase64 || '').replace(/^data:image\/\w+;base64,/, '');
+      const imgBuffer = Buffer.from(cleanBase64, 'base64');
+      if (imgBuffer.length > 0) {
+        const localResult = await runOnnxClassification(imgBuffer, cleanBase64);
+        return res.json(localResult);
+      }
+    } catch {
+      // Fall through to error response
+    }
     return res.status(500).json({
       error: error?.message || 'Classification inference failed. Please check network or try again.',
       type: 'INFERENCE_ERROR',
@@ -531,8 +530,9 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, () => {
-    console.log(`EcoSort AI server listening on http://localhost:${PORT}`);
+  const portNumber = Number(PORT) || 3000;
+  app.listen(portNumber, '0.0.0.0', () => {
+    console.log(`EcoSort AI server listening on http://0.0.0.0:${portNumber}`);
   });
 }
 
